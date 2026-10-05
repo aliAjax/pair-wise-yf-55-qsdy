@@ -1,5 +1,6 @@
 import { configureStore, createSlice, type PayloadAction } from '@reduxjs/toolkit';
 import { createApi, fakeBaseQuery } from '@reduxjs/toolkit/query/react';
+import { validateDraft, type RuleIssue } from './rules';
 
 export type FieldType = 'text' | 'number' | 'select' | 'date';
 export interface FormField { id: string; label: string; type: FieldType; required: boolean; options?: string[]; }
@@ -7,7 +8,7 @@ export interface LinkRule { id: string; fieldId: string; operator: 'equals' | 'n
 export interface FormVersion { id: string; label: string; createdAt: string; fields: FormField[]; rules: LinkRule[]; }
 export interface Snapshot { id: string; versionId: string; label: string; data: Record<string, string>; }
 
-interface SchemaState { versions: FormVersion[]; rules: LinkRule[]; activeVersionId: string; previewVersionId: string; snapshots: Snapshot[]; }
+interface SchemaState { versions: FormVersion[]; activeVersionId: string; previewVersionId: string; snapshots: Snapshot[]; publishIssues: RuleIssue[]; }
 type RootShape = { schema: SchemaState };
 
 const initial: SchemaState = {
@@ -37,11 +38,12 @@ const initial: SchemaState = {
       ]
     }
   ],
-  rules: [],
   snapshots: [
     { id: 's1', versionId: 'v1', label: '八月培训预算', data: { name: '培训预算', department: '财务', amount: '12000' } },
-    { id: 's2', versionId: 'v1', label: '市场活动费用', data: { name: '新品活动', department: '市场', amount: '58000' } }
-  ]
+    { id: 's2', versionId: 'v1', label: '市场活动费用', data: { name: '新品活动', department: '市场', amount: '58000' } },
+    { id: 's3', versionId: 'v2', label: '品牌推广费', data: { department: '财务', name: '品牌推广', budgetCode: 'K-2026-09', amount: '88000', invoiceDate: '' } }
+  ],
+  publishIssues: []
 };
 
 const slice = createSlice({
@@ -62,16 +64,39 @@ const slice = createSlice({
       const id = `field-${Date.now()}`;
       version.fields.push({ id, label: '新字段', type: 'text', required: false });
     },
-    addRule(state, action: PayloadAction<Omit<LinkRule, 'id'>>) { state.rules.push({ ...action.payload, id: `rule-${Date.now()}` }); },
+    addRule(state, action: PayloadAction<Omit<LinkRule, 'id'>>) {
+      const version = state.versions.find((item) => item.id === state.previewVersionId);
+      if (!version) return;
+      version.rules.push({ ...action.payload, id: `rule-${Date.now()}-${Math.random().toString(36).slice(2, 7)}` });
+      state.publishIssues = []; // 草稿已改动，撤下上次发布的拦截提示
+    },
+    removeRule(state, action: PayloadAction<string>) {
+      const version = state.versions.find((item) => item.id === state.previewVersionId);
+      if (!version) return;
+      version.rules = version.rules.filter((item) => item.id !== action.payload);
+      state.publishIssues = [];
+    },
     publishVersion(state) {
       const source = state.versions.find((item) => item.id === state.previewVersionId);
       if (!source) return;
-      const id = `v${state.versions.length + 1}`;
-      state.versions.push({ ...structuredClone(source), id, label: `费用申请 ${id}`, createdAt: new Date().toISOString().slice(0, 10) });
+      // 发布前校验：成环 / 引用被移除字段时中止，草稿原样保留，可继续修改
+      const issues = validateDraft(source.fields, source.rules);
+      if (issues.length) {
+        state.publishIssues = issues;
+        return;
+      }
+      const nextNum = state.versions.reduce((max, v) => {
+        const n = Number.parseInt(v.id.replace(/^v/, ''), 10);
+        return Number.isNaN(n) ? max : Math.max(max, n);
+      }, 0) + 1;
+      const id = `v${nextNum}`;
+      const clone = JSON.parse(JSON.stringify(source)) as FormVersion;
+      state.versions.push({ ...clone, id, label: `费用申请 ${id}`, createdAt: new Date().toISOString().slice(0, 10) });
       state.activeVersionId = id; state.previewVersionId = id;
+      state.publishIssues = [];
     },
-    selectPreview(state, action: PayloadAction<string>) { state.previewVersionId = action.payload; },
-    replaceState(_state, action: PayloadAction<SchemaState>) { return action.payload; }
+    selectPreview(state, action: PayloadAction<string>) { state.previewVersionId = action.payload; state.publishIssues = []; },
+    replaceState(_state, action: PayloadAction<SchemaState>) { return { ...action.payload, publishIssues: [] }; }
   }
 });
 
@@ -89,7 +114,7 @@ export const schemaApi = createApi({
 });
 
 export const { useSchemaHistoryQuery } = schemaApi;
-export const { addField, addRule, publishVersion, reorderFields, replaceState, selectPreview } = slice.actions;
+export const { addField, addRule, publishVersion, reorderFields, removeRule, replaceState, selectPreview } = slice.actions;
 export const store = configureStore({ reducer: { schema: slice.reducer, [schemaApi.reducerPath]: schemaApi.reducer }, middleware: (getDefault) => getDefault().concat(schemaApi.middleware) });
 if (typeof window !== 'undefined') {
   const saved = localStorage.getItem('yf55-schema-state');
